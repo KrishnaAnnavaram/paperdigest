@@ -111,7 +111,7 @@ paperdigest gives each of these questions its own component. Each component has 
 | QA systems | `closed-book` (answer from the summary), RAG with `bm25`, `tfidf` or `hybrid` retrieval |
 | LLM providers | `fake` (offline, default), `openrouter`, `openai` |
 | Offline mode | Synthetic papers, extractive summarizers, BM25, TF-IDF and the fake LLM |
-| Tests | **34** unit tests (`pytest`), 1 more skips without the optional `rouge-score` package |
+| Tests | **34** pass in CI (`.[dev]` only). 1 more test skips without the optional `rouge-score` package |
 
 ```mermaid
 flowchart LR
@@ -507,8 +507,7 @@ All numbers below come from this repository. The benchmark numbers use **synthet
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests (local, Python 3.13) | **34 passed, 1 skipped** (rouge-score cross-check) | `pytest -q` |
-| Unit tests (clean venv with `.[dev]` only, as in CI) | **34 passed, 1 skipped** | `pip install -e ".[dev]" && pytest -q` |
+| Unit tests | CI installs only `.[dev]`: **34 passed**, 1 skipped (the `rouge-score` cross-check, optional package) | `pip install -e ".[dev]" && pytest -q` |
 
 Summarization on synthetic papers (60-word budget, mean and 95% CI):
 
