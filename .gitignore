@@ -1,0 +1,32 @@
+# secrets and local config
+.env
+.env.*
+!.env.example
+
+# local data: papers, datasets, PDFs, predictions
+/data/*
+!/data/README.md
+*.pdf
+*.db
+*.parquet
+
+# runs, caches, models
+/runs/
+/outputs/
+/hf_cache/
+*.pt
+*.bin
+*.safetensors
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
