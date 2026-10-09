@@ -70,6 +70,7 @@ This README is the **one location that explains all of paperdigest**. It gives t
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one paper](#42-the-life-cycle-of-one-paper)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Datasets and samples](#5-datasets-and-samples)
 6. ✂️ [Token-aware chunks](#6-token-aware-chunks)
 7. 🟢 [Summarizers](#7-summarizers)
@@ -140,6 +141,45 @@ flowchart LR
 | Synthetic data | `src/paperdigest/synthetic.py` | Papers with abstracts, questions, gold answers and evidence |
 | CLI | `src/paperdigest/cli.py` | `synth`, `models`, `summarize-bench`, `qa-bench`, `digest`, `demo` |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>paperdigest command"]
+    subgraph DATAIN["Data in"]
+        CFG["config.py<br/>Settings.from_env"]
+        DATA["data.py<br/>load_summarization, load_qa, sample"]
+        SYN["synthetic.py<br/>generate, to_rows"]
+    end
+    subgraph SYSTEMS["Systems"]
+        SUM["systems/summarizers.py<br/>lead, textrank, mapreduce, hf"]
+        QA["systems/qa.py<br/>retrievers, RAGQA, ClosedBookQA"]
+        LLM["llm.py<br/>make_client, FakeLLM, OpenAICompatibleClient"]
+    end
+    subgraph SCORE["Scores"]
+        BENCH["bench.py<br/>run_summarization, run_qa"]
+        MET["metrics.py<br/>ROUGE, EM, F1, recall@k, MRR, bootstraps"]
+    end
+    TXT["text.py<br/>sentences, chunk_text"]
+
+    CLI --> CFG
+    CLI --> DATA
+    CLI --> SYN
+    CLI --> SUM
+    CLI --> QA
+    CLI --> LLM
+    CLI --> BENCH
+    SYN --> DATA
+    BENCH --> MET
+    BENCH --> LLM
+    SUM --> LLM
+    SUM --> TXT
+    QA --> LLM
+    QA --> TXT
+    LLM --> TXT
+    MET --> TXT
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -198,6 +238,21 @@ paperdigest/
 
 `bench.py` records each error of a system with the paper ID and goes on. `OpenAICompatibleClient` raises `LLMError` after its retries. Thus no error text reaches a prediction, a summary or a question.
 
+```mermaid
+flowchart LR
+    DOC[/"One paper or question"/] --> CALL["system.summarize<br/>or system.answer"]
+    CALL --> LLM["OpenAICompatibleClient.complete<br/>retries"]
+    LLM --> OK{"Usable answer?"}
+    OK -- "yes" --> PRED["Prediction text"]
+    OK -- "no" --> ERR["LLMError"]
+    CALL -- "other exception" --> FAIL
+    ERR --> FAIL["failures: system name,<br/>paper ID, error type"]
+    PRED --> SCORE["Score and store a record"]
+    FAIL --> NEXT["Go on with the next paper"]
+    SCORE --> NEXT
+    FAIL --> BOARD[/"Leaderboard column n_failed"/]
+```
+
 ### 3.6 Deterministic decoding with versioned prompts
 
 The HTTP client sends `temperature` 0 and a fixed `seed`. Hugging Face models use beam search with no sampling. Each record stores `run_id` and `prompt_version`.
@@ -213,20 +268,60 @@ The HTTP client sends `temperature` 0 and a fixed `seed`. Hugging Face models us
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    J1["summarization.jsonl"] --> L1["load_summarization + parse_summ"]
-    J2["qa.jsonl"] --> L2["load_qa + parse_qa"]
-    L1 --> S1["sample (seeded)"]
-    L2 --> S2["sample (seeded)"]
+flowchart TD
+    J1[/"summarization.jsonl"/] --> L1["load_summarization + parse_summ"]
+    J2[/"qa.jsonl"/] --> L2["load_qa + parse_qa"]
+    L1 --> V{"Valid JSON and fields,<br/>reference 20 words or more?"}
+    L2 --> V
+    V -- "no" --> DE[/"DataError, exit 1"/]
+    V -- "yes, summarization" --> S1["sample (seeded)"]
+    V -- "yes, QA" --> S2["sample (seeded)"]
     S1 --> SUM["summarizers: lead, textrank, mapreduce, hf:*"]
+    LLM[("LLM provider<br/>fake, openrouter or openai")] --> SUM
     SUM --> RS["run_summarization: ROUGE, number check, failures"]
     S2 --> CB["closed-book QA (from a summary)"]
     S2 --> RAG["RAG: bm25 / tfidf / hybrid + LLM"]
+    LLM --> CB
+    LLM --> RAG
     CB & RAG --> RQ["run_qa: EM, F1, recall@k, MRR"]
-    RS & RQ --> OUT["predictions.jsonl + leaderboard.json + leaderboard.md"]
+    RS & RQ --> OUT[("runs/name/<br/>predictions.jsonl + leaderboard.json + leaderboard.md")]
+    OUT --> HUMAN{{"HUMAN<br/>researcher reads the CIs and failures<br/>before a leaderboard is published"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one paper
+
+```mermaid
+stateDiagram-v2
+    state "Line in a JSONL file" as Line
+    state "SummItem or QAItem" as Item
+    state "Not in the sample" as LeftOut
+    state "In the sample" as Sampled
+    state "Has a summary" as Summarized
+    state "Has answers and rankings" as Answered
+    state "Failure recorded" as Failed
+    state "Scored" as Scored
+    state "Record in predictions.jsonl" as Recorded
+    state "In the leaderboard" as Board
+    [*] --> Line
+    Line --> DataError: not JSON, missing field or short reference
+    Line --> Item: parse_summ or parse_qa
+    Item --> LeftOut: sample with the seed
+    Item --> Sampled: sample with the seed
+    Sampled --> Summarized: summarize
+    Sampled --> Answered: answer each question
+    Sampled --> Failed: exception in a system
+    Summarized --> Scored: rouge, number_consistency
+    Answered --> Scored: exact_match, token_f1, recall_at_k, reciprocal_rank
+    Scored --> Recorded: run_id and prompt_version
+    Recorded --> Board: mean_with_ci
+    Failed --> Board: n_failed
+    Board --> [*]
+    LeftOut --> [*]
+    DataError --> [*]
+```
 
 1. The loader reads the paper and checks its fields. A short reference stops the load.
 2. The seeded sample selects the paper or leaves it out.
@@ -236,6 +331,48 @@ flowchart TB
 6. The benchmark scores the answer against the gold answers and the ranking against the evidence.
 7. The leaderboard adds the scores of the paper to the means and the bootstrap intervals.
 
+### 4.3 Who does which step
+
+The sequence shows the `qa-bench` command with a real LLM provider.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor R as Researcher
+    participant CLI as paperdigest CLI
+    participant DATA as data.py
+    participant BENCH as bench.py
+    participant SUM as summarizers.py
+    participant QA as qa.py
+    participant LLM as OpenAICompatibleClient
+    participant API as OpenRouter or OpenAI
+    participant MET as metrics.py
+    participant FS as runs/ folder
+
+    R->>CLI: paperdigest qa-bench --data qa.jsonl --systems closed-book bm25 hybrid
+    CLI->>CLI: Settings.from_env, key from the environment
+    CLI->>DATA: load_qa, then sample(n, seed)
+    CLI->>CLI: _summarizers, _qa_systems, make_client
+    CLI->>BENCH: run_qa(items, systems, summarizer)
+    BENCH->>SUM: summarize each paper, closed-book only
+    loop each system and question
+        BENCH->>QA: answer(question, paragraphs, summary)
+        opt RAG system
+            QA->>QA: retriever.rank, take the top k paragraphs
+        end
+        QA->>LLM: complete(answer prompt)
+        LLM->>API: POST chat/completions, temperature 0, fixed seed
+        API-->>LLM: answer content
+        LLM-->>QA: answer text, or LLMError after the retries
+        QA-->>BENCH: Answer(text, ranked)
+        BENCH->>MET: exact_match, token_f1, recall_at_k, reciprocal_rank
+    end
+    BENCH->>MET: mean_with_ci for each column
+    BENCH-->>CLI: leaderboard, failures, records
+    CLI->>FS: predictions.jsonl, leaderboard.json, leaderboard.md
+    CLI-->>R: Markdown table and failure counts
+```
+
 ---
 
 ## 5. Datasets and samples
@@ -244,6 +381,24 @@ flowchart TB
 |---|---|---|
 | Summarization item | `id`, `document`, `summary` | Non-empty strings. Summary of 20 words or more |
 | QA item | `id`, `paragraphs`, `questions[question, answers, evidence]` | Non-empty paragraphs. Each question has 1 or more gold answers. Evidence indices in range |
+
+```mermaid
+flowchart TD
+    IN[/"JSONL file"/] --> LINE["Read each non-empty line"]
+    LINE --> JS{"Valid JSON?"}
+    JS -- "no" --> ERR[/"DataError with the line number"/]
+    JS -- "yes" --> KIND{"File kind"}
+    KIND -- "summarization" --> PS["parse_summ<br/>id, document, summary non-empty"]
+    KIND -- "QA" --> PQ["parse_qa<br/>paragraphs, answers, evidence range"]
+    PS --> LEN{"Summary 20 words or more?"}
+    LEN -- "no" --> ERR
+    LEN -- "yes" --> ITEMS["List of SummItem"]
+    PQ -- "problem" --> ERR
+    PQ -- "valid" --> QITEMS["List of QAItem"]
+    ITEMS --> SAMP["sample(n, seed)<br/>random indices, kept in file order"]
+    QITEMS --> SAMP
+    SAMP --> OUT[/"Sampled items"/]
+```
 
 **Procedure**
 
@@ -258,6 +413,22 @@ Optional loaders: `load_hf_summarization` (Hugging Face dataset, seeded sample) 
 ## 6. Token-aware chunks
 
 **Purpose.** Cut a long text into parts that a model can read, without broken words or sentences.
+
+```mermaid
+flowchart TD
+    IN[/"Text, max_tokens, overlap_tokens"/] --> CHK{"overlap 0 or more and<br/>less than max_tokens?"}
+    CHK -- "no" --> ERR[/"ValueError"/]
+    CHK -- "yes" --> SENT["sentences: split the text"]
+    SENT --> LONG{"Sentence longer<br/>than max_tokens?"}
+    LONG -- "yes" --> CUT["Split it on word boundaries"]
+    LONG -- "no" --> KEEP["Keep the sentence"]
+    CUT --> PACK["Add whole sentences to the chunk<br/>while the total is max_tokens or less"]
+    KEEP --> PACK
+    PACK --> MORE{"Sentences left?"}
+    MORE -- "no" --> OUT[/"List of Chunk"/]
+    MORE -- "yes" --> BACK["Step back whole sentences<br/>up to overlap_tokens words"]
+    BACK --> PACK
+```
 
 **Procedure**
 
@@ -274,8 +445,28 @@ Optional loaders: `load_hf_summarization` (Hugging Face dataset, seeded sample) 
 |---|---|---|
 | `lead` | The first sentences up to the word budget | Nothing |
 | `textrank` | PageRank (damping 0.85, 50 iterations) on the TF-IDF cosine graph of the sentences. The best sentences in document order | Nothing |
-| `mapreduce` | The LLM summarizes each chunk (80 words), then combines the partial summaries (word budget) | An LLM client |
+| `mapreduce` | The LLM summarizes each chunk (80 words), then combines the partial summaries (word budget). A text with one chunk keeps its map summary | An LLM client |
 | `hf:<key>` | A seq2seq checkpoint from the registry, beam search (4 beams), no sampling | The `hf` extra |
+
+```mermaid
+flowchart TD
+    NAME[/"System name from --systems"/] --> PICK{"Name"}
+    PICK -- "lead" --> LEAD["LeadSummarizer<br/>first sentences to the budget"]
+    PICK -- "textrank" --> TR["TextRankSummarizer<br/>TF-IDF graph, PageRank 0.85"]
+    PICK -- "mapreduce" --> CH["chunk_text"]
+    PICK -- "hf:key" --> REG{"key in HF_REGISTRY?"}
+    PICK -- "other" --> ERR[/"ValueError"/]
+    REG -- "no" --> ERR2[/"KeyError"/]
+    REG -- "yes" --> HF["HFSummarizer<br/>prefix, truncate, 4 beams"]
+    CH --> MAP["LLM map prompt<br/>each chunk, 80 words"]
+    MAP --> ONE{"One chunk?"}
+    ONE -- "yes" --> OUT
+    ONE -- "no" --> RED["LLM reduce prompt<br/>word budget"]
+    RED --> OUT[/"Summary text"/]
+    LEAD --> OUT
+    TR --> OUT
+    HF --> OUT
+```
 
 **The Hugging Face registry (17 checkpoints)**
 
@@ -316,6 +507,24 @@ LED gets global attention on its first token. Run `paperdigest models` to print 
 
 The answer prompt asks for a short span, or `unanswerable` if the context has no answer.
 
+```mermaid
+flowchart TD
+    IN[/"Question, paragraphs, summary"/] --> SYS{"QA system"}
+    SYS -- "closed-book" --> HAS{"Summary given?"}
+    HAS -- "no" --> ERR[/"ValueError"/]
+    HAS -- "yes" --> CTX1["Context is the summary<br/>no ranking"]
+    SYS -- "bm25" --> BM["BM25Retriever<br/>k1 1.5, b 0.75"]
+    SYS -- "tfidf" --> TF["TfidfRetriever<br/>cosine of TF-IDF vectors"]
+    SYS -- "hybrid" --> HY["HybridRetriever<br/>RRF of bm25 and tfidf, k 60"]
+    BM --> TOP["Take the top k paragraphs<br/>default 3"]
+    TF --> TOP
+    HY --> TOP
+    TOP --> PROMPT["Answer prompt<br/>context and question"]
+    CTX1 --> PROMPT
+    PROMPT --> LLM["llm.complete, 64 tokens"]
+    LLM --> OUT[/"Answer: text and ranked paragraph indices"/]
+```
+
 ---
 
 ## 9. The LLM client
@@ -326,6 +535,25 @@ The answer prompt asks for a short span, or `unanswerable` if the context has no
 | `OpenAICompatibleClient` | `openrouter` or `openai` | Chat completions over HTTPS with the standard library. Temperature 0, fixed seed |
 
 **Error procedure**
+
+```mermaid
+flowchart TD
+    MK["make_client"] --> PROV{"Provider"}
+    PROV -- "fake" --> FAKE[/"FakeLLM<br/>deterministic, offline"/]
+    PROV -- "openrouter or openai" --> KEY{"Key in the environment?"}
+    KEY -- "no" --> E0[/"LLMError: no API key"/]
+    KEY -- "yes" --> SEND["POST chat/completions<br/>temperature 0, seed, timeout"]
+    SEND --> RES{"Result"}
+    RES -- "answer text" --> EMPTY{"Empty?"}
+    EMPTY -- "no" --> OK[/"Answer text"/]
+    EMPTY -- "yes" --> E1[/"LLMError at once"/]
+    RES -- "bad format" --> E1
+    RES -- "other HTTP status" --> E1
+    RES -- "408, 429, 5xx or network error" --> LEFT{"Retries left?"}
+    LEFT -- "yes" --> WAIT["Wait 1, 2, 4 s<br/>maximum 30 s"]
+    WAIT --> SEND
+    LEFT -- "no" --> E2[/"LLMError after the retries"/]
+```
 
 1. Send the request with the timeout (`PAPERDIGEST_LLM_TIMEOUT`, default 60 s).
 2. If the status is 408, 429, 500, 502, 503 or 504, or the network fails, wait 1, 2, 4 … seconds (maximum 30) and try again.
@@ -343,6 +571,24 @@ The answer prompt asks for a short span, or `unanswerable` if the context has no
 ---
 
 ## 10. Metrics
+
+`metrics.py` scores each prediction, then gives the mean with a bootstrap interval for each column.
+
+```mermaid
+flowchart LR
+    SUMM[/"Summary and reference"/] --> NORM["metric_tokens<br/>lower case, no punctuation, no articles"]
+    NORM --> RG["rouge1, rouge2, rougeL"]
+    SUMM --> NUM["number_consistency<br/>numbers_ok"]
+    ANS[/"Answer and gold answers"/] --> EMF["exact_match, token_f1<br/>best gold answer"]
+    RANK[/"Ranking and evidence"/] --> RET["recall_at_k, reciprocal_rank"]
+    RG --> CI["mean_with_ci<br/>bootstrap_ci, 1,000 draws"]
+    NUM --> CI
+    EMF --> CI
+    RET --> CI
+    RG --> PB["paired_bootstrap<br/>ROUGE-L of the two best systems"]
+    CI --> OUT[/"Leaderboard cells: mean and 95% CI"/]
+    PB --> CMP[/"delta, CI, p-value"/]
+```
 
 | Metric | Meaning |
 |---|---|
@@ -367,16 +613,81 @@ The answer prompt asks for a short span, or `unanswerable` if the context has no
 3. Make one leaderboard row for each summarizer: papers, failures, mean words, and each metric with its CI.
 4. Sort by ROUGE-L and compare the first two systems with a paired bootstrap.
 
+```mermaid
+flowchart TD
+    IN[/"Sampled SummItems, summarizers"/] --> LOOP["For each summarizer and paper"]
+    LOOP --> TRY{"summarize succeeds?"}
+    TRY -- "no" --> FAIL["failures: paper ID and error"]
+    TRY -- "yes" --> SC["rouge, number_consistency, words"]
+    SC --> REC["Record: run_id, prompt_version,<br/>system, doc_id, prediction, scores"]
+    FAIL --> LOOP
+    REC --> LOOP
+    LOOP -- "all done" --> ROW["One row for each summarizer<br/>n_docs, n_failed, mean_words, mean_with_ci"]
+    ROW --> SORT["Sort by ROUGE-L"]
+    SORT --> TWO{"2 or more rows<br/>with common papers?"}
+    TWO -- "yes" --> PB["paired_bootstrap<br/>first minus second"]
+    TWO -- "no" --> OUT
+    PB --> OUT[/"leaderboard, comparison,<br/>failures, records"/]
+```
+
 **QA procedure**
 
-1. If `closed-book` is in the list, make one summary of each paper first.
+1. If `closed-book` is in the list, make one summary of each paper first. A failure in this step stops the run.
 2. For each QA system and each question, get the answer and the ranking. Record a failure and go on if it fails.
 3. Score EM and F1. If the system has a ranking and the question has evidence, score recall@1, 3, 5 and MRR.
 4. Make one leaderboard row for each system and sort by F1.
 
+```mermaid
+flowchart TD
+    IN[/"Sampled QAItems, QA systems"/] --> CB{"closed-book in the list?"}
+    CB -- "yes" --> PRE["Summarize each paper first<br/>a failure stops the run"]
+    CB -- "no" --> LOOP
+    PRE --> LOOP["For each system and question"]
+    LOOP --> TRY{"answer succeeds?"}
+    TRY -- "no" --> FAIL["failures: paper ID and error"]
+    TRY -- "yes" --> EM["exact_match, token_f1"]
+    EM --> HAS{"Ranking and evidence?"}
+    HAS -- "yes" --> RK["recall@1, 3, 5 and MRR"]
+    HAS -- "no" --> REC
+    RK --> REC["Record with gold answers"]
+    FAIL --> LOOP
+    REC --> LOOP
+    LOOP -- "all done" --> ROW["One row for each system<br/>mean_with_ci"]
+    ROW --> SORT["Sort by F1"]
+    SORT --> OUT[/"leaderboard, failures, records"/]
+```
+
 ---
 
 ## 12. The decision rules
+
+The map shows the step where each fixed value applies.
+
+```mermaid
+flowchart LR
+    subgraph DATAR["data.py"]
+        D1["Reference: 20 words or more"] --> D2["Sample: --n 500"]
+    end
+    subgraph SUMR["Summarizers"]
+        S1["Budget: --words 150"] --> S2["Chunks: 400 words, overlap 50"]
+        S2 --> S3["Map step: 80 words"]
+    end
+    subgraph QAR["QA systems"]
+        Q1["BM25: k1 1.5, b 0.75"] --> Q2["RRF constant 60"]
+        Q2 --> Q3["Top --k 3 paragraphs"]
+    end
+    subgraph LLMR["llm.py"]
+        L1["Retry on 408, 429, 500, 502, 503, 504"] --> L2["3 retries, 1, 2, 4 s, maximum 30 s"]
+    end
+    subgraph SCR["bench.py and metrics.py"]
+        B1["Bootstrap: 1,000 draws"]
+    end
+    D2 --> S1
+    D2 --> Q1
+    S3 --> L1
+    Q3 --> L1
+    L2 --> B1
+```
 
 | Value | Where | Number |
 |---|---|---|
@@ -438,7 +749,19 @@ Offline demo (synthetic papers, fake LLM, a few seconds):
 paperdigest demo
 ```
 
-Step by step, offline:
+Step by step, offline. The commands run in this sequence:
+
+```mermaid
+flowchart LR
+    SYN["paperdigest synth"] --> D[("data/synthetic/<br/>summarization.jsonl, qa.jsonl")]
+    REAL[/"Your JSONL files in data/"/] --> SB
+    REAL --> QB
+    D --> SB["summarize-bench"]
+    D --> QB["qa-bench"]
+    SB --> R1[("runs/summ/<br/>predictions and leaderboards")]
+    QB --> R2[("runs/qa/<br/>predictions and leaderboards")]
+    TXT[/"One text or PDF file"/] --> DG["digest<br/>summary and hybrid RAG answers"]
+```
 
 ```bash
 paperdigest synth --out data/synthetic --papers 100
